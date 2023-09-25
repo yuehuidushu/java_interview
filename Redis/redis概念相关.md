@@ -100,3 +100,86 @@ RESP 的特点：实现简单、快速解析、可读性好
 3. For Integers the first byte of the reply is ":" 整数
 4. For Bulk Strings the first byte of the reply is "$" 字符串
 5. For Arrays the first byte of the reply is "*" 数组
+
+# 11 redis 内存碎片
+## 11.1 什么是内存碎片
+你可以将内存碎片简单地理解为那些不可用的空闲内存。
+举个例子：操作系统为你分配了 32 字节的连续内存空间，而你存储数据实际只需要使用 24 字节内存空间，
+那这多余出来的 8 字节内存空间如果后续没办法再被分配存储其他数据的话，就可以被称为内存碎片
+
+![img.png](images/redis概念/内存碎片.png)
+
+内存碎片不会影响redis的性能，但是会增加内存消耗
+
+## 11.2 为什么会产生内存碎片？
+1. 频繁修改 Redis 中的数据也会产生内存碎片。
+
+当 Redis 中的某个数据删除时，Redis 通常不会轻易释放内存给操作系统。
+这个在 Redis 官方文档中也有对应的原话:
+
+2. Redis 存储数据的时候向操作系统申请的内存空间可能会大于数据实际需要的存储空间
+   
+以下是这段 Redis 官方的原话：
+```
+To store user keys, Redis allocates at most as much memory as the maxmemory 
+setting enables (however there are small extra allocations possible)
+```
+Redis 使用 zmalloc 方法(Redis 自己实现的内存分配方法)进行内存分配的时候，
+除了要分配 size 大小的内存之外，还会多分配 PREFIX_SIZE 大小的内存。zmalloc 方法源码如下
+（源码地址：https://github.com/antirez/redis-tools/blob/master/zmalloc.c）
+```c
+void *zmalloc(size_t size) {
+   // 分配指定大小的内存
+   void *ptr = malloc(size+PREFIX_SIZE);
+   if (!ptr) zmalloc_oom_handler(size);
+#ifdef HAVE_MALLOC_SIZE
+   update_zmalloc_stat_alloc(zmalloc_size(ptr));
+   return ptr;
+#else
+   *((size_t*)ptr) = size;
+   update_zmalloc_stat_alloc(size+PREFIX_SIZE);
+   return (char*)ptr+PREFIX_SIZE;
+#endif
+}
+```
+
+![img.png](images/redis概念/jemalloc分配字节.png)
+
+当程序申请的内存最接近某个固定值时，jemalloc 会给它分配相应大小的空间，就比如说程序需要申请 17 字节的内存，
+jemalloc 会直接给它分配 32 字节的内存，这样会导致有 15 字节内存的浪费。不过，jemalloc 
+专门针对内存碎片问题做了优化，一般**不会存在过度碎片化**的问题。
+
+## 11.3 如何查看redis的内存碎片率
+
+Redis 内存碎片率的计算公式：
+`mem_fragmentation_ratio （内存碎片率）=
+used_memory_rss (操作系统实际分配给 Redis 的物理内存空间大小)
+/ used_memory(Redis 内存分配器为了存储数据实际申请使用的内存空间大小)`
+
+也就是说，mem_fragmentation_ratio （内存碎片率）的**值越大代表内存碎片率越严重**。一
+定不要误认为used_memory_rss 减去 used_memory值就是内存碎片的大小！！！
+这不仅包括内存碎片，还包括[其他进程开销，以及共享库、堆栈等的开销]。
+很多小伙伴可能要问了：“多大的内存碎片率才是需要清理呢？”。通常情况下，我们认为 
+mem_fragmentation_ratio > 1.5 的话才需要清理内存碎片。 [mem_fragmentation_ratio > 1.5 ]
+意味着你使用 Redis 存储实际大小 2G 的数据需要使用大于 3G 的内存。
+
+## 11.4 如何清理Redis的内存碎片
+Redis4.0-RC3 版本以后自带了内存整理，可以避免内存碎片率过大的问题。
+直接通过 config set 命令将 activedefrag 配置项设置为 yes 即可。
+```config set activedefrag yes```
+
+具体什么时候清理需要通过下面两个参数控制：
+- 内存碎片占用空间达到 500mb 的时候开始清理
+  ```config set active-defrag-ignore-bytes 500mb```
+- 内存碎片率大于 1.5 的时候开始清理
+   ```config set active-defrag-threshold-lower 50```
+  
+通过 Redis 自动内存碎片清理机制[可能会对 Redis 的性能产生影响]，我们可以通过下面
+两个参数来减少对 Redis 性能的影响：
+
+- 内存碎片清理所占用 CPU 时间的比例不低于 20%
+```config set active-defrag-cycle-min 20```
+- 内存碎片清理所占用 CPU 时间的比例不高于 50%
+```config set active-defrag-cycle-max 50```
+另外，重启节点可以做到内存碎片重新整理。如果你采用的是高可用架构的 Redis 集群的话，
+  你可以[将碎片率过高的主节点转换为从节点]，以便进行安全重启.
